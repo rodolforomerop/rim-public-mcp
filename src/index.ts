@@ -27,6 +27,9 @@ import {
     ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { promises as fs } from 'fs';
+import * as path from 'path';
+import { homedir } from 'os';
 
 const API_BASE = process.env.RIM_API_BASE || 'https://registroimeimultibanda.cl';
 const API_KEY = process.env.RIM_PUBLIC_API_KEY;
@@ -89,6 +92,86 @@ async function callApi(
     return parsed;
 }
 
+/* ----------------------------- Image helpers ----------------------------- */
+
+/**
+ * Lee una imagen del filesystem (típicamente del directorio inbound de
+ * OpenClaw) y la procesa con la API de RIM para extraer IMEIs.
+ *
+ * Si no se pasa filePath, busca el archivo más reciente en
+ * ~/.openclaw/media/inbound/ que tenga extensión de imagen.
+ *
+ * Devuelve el resultado de la API + qué archivo se procesó (útil para debug).
+ */
+async function processInboundImage(filePath?: string): Promise<any> {
+    let resolvedPath = filePath;
+
+    if (!resolvedPath) {
+        const inboundDir = path.join(homedir(), '.openclaw', 'media', 'inbound');
+        try {
+            const files = await fs.readdir(inboundDir);
+            const imageFiles = files.filter((f) =>
+                /\.(jpe?g|png|webp|heic|gif)$/i.test(f),
+            );
+
+            if (imageFiles.length === 0) {
+                return {
+                    error: 'no_inbound_images',
+                    message: `No hay imágenes en ${inboundDir}`,
+                };
+            }
+
+            const stats = await Promise.all(
+                imageFiles.map(async (f) => {
+                    const p = path.join(inboundDir, f);
+                    const s = await fs.stat(p);
+                    return { path: p, mtimeMs: s.mtimeMs };
+                }),
+            );
+            stats.sort((a, b) => b.mtimeMs - a.mtimeMs);
+            resolvedPath = stats[0].path;
+        } catch (e: any) {
+            return {
+                error: 'inbound_dir_unreadable',
+                message: `No se pudo leer ${inboundDir}: ${e?.message || e}`,
+            };
+        }
+    }
+
+    let buffer: Buffer;
+    try {
+        buffer = await fs.readFile(resolvedPath);
+    } catch (e: any) {
+        return {
+            error: 'file_not_readable',
+            message: `No se pudo leer ${resolvedPath}: ${e?.message || e}`,
+        };
+    }
+
+    // Detectar mime type por extensión.
+    const ext = path.extname(resolvedPath).slice(1).toLowerCase();
+    const mimeMap: Record<string, string> = {
+        jpg: 'jpeg',
+        jpeg: 'jpeg',
+        png: 'png',
+        webp: 'webp',
+        heic: 'heic',
+        gif: 'gif',
+    };
+    const mime = mimeMap[ext] || 'jpeg';
+    const dataUri = `data:image/${mime};base64,${buffer.toString('base64')}`;
+
+    const apiResult = await callApi('/api/v1/imei/parse-photo', {
+        photoDataUri: dataUri,
+    });
+
+    return {
+        ...apiResult,
+        processedFile: resolvedPath,
+        sizeBytes: buffer.byteLength,
+    };
+}
+
 /* ------------------------------ Tool schemas ----------------------------- */
 
 const validateSchema = z.object({
@@ -127,6 +210,18 @@ const detectDuplicatesSchema = z.object({
         .min(1)
         .max(10000)
         .describe('Lista de IMEIs (15 dígitos cada uno, se limpian si vienen con basura). Máx 10.000.'),
+});
+
+const parseInboundImageSchema = z.object({
+    imagePath: z
+        .string()
+        .optional()
+        .describe(
+            'Path absoluto a un archivo de imagen específico. Si NO se pasa, ' +
+                'toma automáticamente el archivo más reciente de ' +
+                '~/.openclaw/media/inbound/ (donde OpenClaw guarda los ' +
+                'attachments de Telegram/Discord/etc).',
+        ),
 });
 
 const exportSubtelSchema = z.object({
@@ -224,12 +319,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: 'rim_parse_imeis_from_photo',
                 description:
-                    'Extrae IMEIs y serial number desde una foto del dispositivo (caja, etiqueta, o pantalla *#06#). Acepta photoUrl (URL pública) o photoDataUri (base64). Útil cuando el cliente final manda solo una foto sin escribir nada. Devuelve { imei1, imei2?, serialNumber?, found }.',
+                    'Extrae IMEIs y serial number desde una foto del dispositivo (caja, etiqueta, o pantalla *#06#). Acepta photoUrl (URL pública) o photoDataUri (base64). Útil cuando ya tenés la imagen en URL o base64. Devuelve { imei1, imei2?, serialNumber?, found }. **Para imágenes recibidas por Telegram/chat, usar mejor `rim_parse_inbound_image` que toma el archivo del disco automáticamente.**',
                 inputSchema: {
                     type: 'object',
                     properties: {
                         photoUrl: { type: 'string', description: 'URL pública de la imagen (jpg/png), máx 10MB.' },
                         photoDataUri: { type: 'string', description: 'Imagen como data URI base64.' },
+                    },
+                },
+            },
+            {
+                name: 'rim_parse_inbound_image',
+                description:
+                    '**ACCIÓN DEFAULT cuando el cliente final envía una foto por Telegram/Discord/etc.** Lee la imagen directamente del directorio donde OpenClaw guarda los attachments (~/.openclaw/media/inbound/), la convierte a base64 internamente, y la procesa con la API de RIM para extraer IMEIs + serial number. Si no se pasa imagePath, toma automáticamente el archivo más reciente. Esto evita depender de la vision nativa del modelo del agente, que a veces falla. Devuelve { imei1, imei2?, serialNumber?, found, processedFile }.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        imagePath: {
+                            type: 'string',
+                            description:
+                                'Path absoluto del archivo. Si se omite, toma el más reciente de ~/.openclaw/media/inbound/.',
+                        },
                     },
                 },
             },
@@ -345,6 +455,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const parsed = parsePhotoSchema.parse(args || {});
                 const data = await callApi('/api/v1/imei/parse-photo', parsed);
                 return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+            }
+
+            case 'rim_parse_inbound_image': {
+                const parsed = parseInboundImageSchema.parse(args || {});
+                const result = await processInboundImage(parsed.imagePath);
+                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
             }
 
             case 'rim_detect_duplicate_imeis': {
